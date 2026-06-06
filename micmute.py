@@ -508,6 +508,7 @@ class FloatIndicator(QWidget):
     settingsRequested = pyqtSignal()
     hideRequested    = pyqtSignal()
     quitRequested    = pyqtSignal()
+    lockRequested    = pyqtSignal()
 
     @property
     def SIZE(self) -> int:
@@ -585,6 +586,9 @@ class FloatIndicator(QWidget):
         a_tog  = menu.addAction("取消静音" if mic.is_muted() else "静音麦克风")
         a_set  = menu.addAction("设置…")
         menu.addSeparator()
+        a_lock = menu.addAction("锁定指示器")
+        a_lock.triggered.connect(self.lockRequested.emit)
+        menu.addSeparator()
         a_hide = menu.addAction("隐藏指示器")
         menu.addSeparator()
         a_quit = menu.addAction("退出")
@@ -643,7 +647,18 @@ class FloatIndicator(QWidget):
             p.setBrush(QColor(255, 255, 255, 30))
             p.drawPath(hl)
 
-        # 锁定时: 只画小圆点, 不画文字/音量环
+        # 音量环 (锁定时也保留)
+        if not muted and self._level > 0.01:
+            perim = 5.4 * h
+            lvl = min(1.0, self._level * 4)
+            dp = [perim * lvl, perim * (1 - lvl)]
+            ring_pen = QPen(QColor(255, 255, 255, 190), 2.5,
+                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+            ring_pen.setDashPattern(dp)
+            p.setPen(ring_pen); p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(tri)
+
+        # 锁定时: 只画小圆点, 不画文字/小三角
         if locked:
             dot_color = QColor(255, 170, 170, 140) if muted else QColor(255, 255, 255, 120)
             p.setPen(Qt.PenStyle.NoPen)
@@ -655,17 +670,6 @@ class FloatIndicator(QWidget):
         # 文字/图标颜色 (静音时极淡粉)
         accent = QColor(255, 160, 160) if muted else QColor(255, 255, 255)
         label  = "MUTE" if muted else ("TALK" if self._state == "talking" else "ON")
-
-        # 音量环
-        if not muted and self._level > 0.01:
-            perim = 5.4 * h
-            lvl = min(1.0, self._level * 4)
-            dp = [perim * lvl, perim * (1 - lvl)]
-            ring_pen = QPen(QColor(255, 255, 255, 190), 2.5,
-                            Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-            ring_pen.setDashPattern(dp)
-            p.setPen(ring_pen); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(tri)
 
         # 描边 (静音时极淡)
         if muted:
@@ -863,6 +867,7 @@ class App:
         self.ind.toggled.connect(self._do_toggle)
         self.ind.settingsRequested.connect(self.open_settings)
         self.ind.hideRequested.connect(self._hide_ind)
+        self.ind.lockRequested.connect(self._toggle_lock)
         self.ind.quitRequested.connect(self.shutdown)
 
         # 热键 (必须在 QApplication 存在后创建)
