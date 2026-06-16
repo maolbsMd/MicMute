@@ -65,7 +65,7 @@ from qfluentwidgets import (
     PrimaryPushButton, RadioButton, CheckBox,
     StrongBodyLabel, BodyLabel, TitleLabel, CaptionLabel, isDarkTheme,
 )
-from pynput import keyboard as kb, mouse as ms
+from pynput import keyboard as kb
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume, IAudioMeterInformation
 from pycaw.constants import CLSID_MMDeviceEnumerator, EDataFlow, DEVICE_STATE
 from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
@@ -275,10 +275,16 @@ def get_auto_start() -> bool:
 # ---------------------------------------------------------------------------
 # Win32 热键解析
 # ---------------------------------------------------------------------------
-_MOUSE_BTNS = {
-    "x1": ms.Button.x1, "x2": ms.Button.x2,
-    "middle": ms.Button.middle, "left": ms.Button.left, "right": ms.Button.right,
+# Windows 鼠标虚拟键码 — GetAsyncKeyState 轮询比 pynput 鼠标钩子更可靠
+_MOUSE_VK = {
+    "x1":     0x05,  # VK_XBUTTON1
+    "x2":     0x06,  # VK_XBUTTON2
+    "middle": 0x04,  # VK_MBUTTON
+    "left":   0x01,  # VK_LBUTTON
+    "right":  0x02,  # VK_RBUTTON
 }
+_GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
+_GetAsyncKeyState.restype = ctypes.c_short
 _VK = {
     **{c: 0x41 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")},
     **{str(i): 0x30 + i for i in range(10)},
@@ -334,8 +340,8 @@ class HotkeyManager:
         self._on_toggle  = on_toggle
         self._on_ptt_on  = on_ptt_on
         self._on_ptt_off = on_ptt_off
-        self._mouse_listener = None
-        self._kb_listener    = None
+        self._mouse_timer   = None
+        self._kb_listener   = None
         self._registered: list[int] = []
         self._filter = _HotkeyFilter(self._on_win32_hotkey)
         QApplication.instance().installNativeEventFilter(self._filter)
@@ -363,22 +369,31 @@ class HotkeyManager:
         elif hid == HK_PTT:
             self._on_ptt_on()
 
-    # ---- pynput 鼠标 -------------------------------------------------------
+    # ---- 鼠标 (GetAsyncKeyState 轮询, 比 pynput 钩子更可靠) -----------
     def _start_mouse(self, btn_name: str, is_ptt: bool):
-        button = _MOUSE_BTNS.get(btn_name)
-        if button is None:
+        vk = _MOUSE_VK.get(btn_name)
+        if vk is None:
             return
+        self._mouse_vk = vk
+        self._mouse_is_ptt = is_ptt
+        self._mouse_was_down = False
 
-        def on_click(x, y, btn, pressed):
-            if btn != button:
-                return
-            if is_ptt:
-                (self._on_ptt_on if pressed else self._on_ptt_off)()
-            elif pressed:
-                self._on_toggle()
+        def poll():
+            down = (_GetAsyncKeyState(self._mouse_vk) & 0x8000) != 0
+            if down and not self._mouse_was_down:
+                self._mouse_was_down = True
+                if self._mouse_is_ptt:
+                    self._on_ptt_on()
+                else:
+                    self._on_toggle()
+            elif not down and self._mouse_was_down:
+                self._mouse_was_down = False
+                if self._mouse_is_ptt:
+                    self._on_ptt_off()
 
-        self._mouse_listener = ms.Listener(on_click=on_click)
-        self._mouse_listener.start()
+        self._mouse_timer = QTimer()
+        self._mouse_timer.timeout.connect(poll)
+        self._mouse_timer.start(50)  # 50ms 轮询
 
     # ---- pynput 键盘 PTT ---------------------------------------------------
     def _start_kb_ptt(self, spec: str):
@@ -432,14 +447,16 @@ class HotkeyManager:
 
     def stop(self):
         self._unreg_all()
-        for listener in (self._mouse_listener, self._kb_listener):
-            if listener:
-                try:
-                    listener.stop()
-                except Exception:
-                    pass
-        self._mouse_listener = None
-        self._kb_listener    = None
+        if self._mouse_timer is not None:
+            self._mouse_timer.stop()
+            self._mouse_timer.deleteLater()
+            self._mouse_timer = None
+        if self._kb_listener is not None:
+            try:
+                self._kb_listener.stop()
+            except Exception:
+                pass
+        self._kb_listener = None
 
     def restart(self):
         self.stop()
