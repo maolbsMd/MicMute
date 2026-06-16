@@ -272,19 +272,52 @@ def get_auto_start() -> bool:
     except Exception:
         return False
 
+def is_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def relaunch_as_admin():
+    try:
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------------------
 # Win32 热键解析
 # ---------------------------------------------------------------------------
-# Windows 鼠标虚拟键码 — GetAsyncKeyState 轮询比 pynput 鼠标钩子更可靠
-_MOUSE_VK = {
-    "x1":     0x05,  # VK_XBUTTON1
-    "x2":     0x06,  # VK_XBUTTON2
-    "middle": 0x04,  # VK_MBUTTON
-    "left":   0x01,  # VK_LBUTTON
-    "right":  0x02,  # VK_RBUTTON
-}
-_GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
-_GetAsyncKeyState.restype = ctypes.c_short
+# Win32 鼠标底层钩子常量
+WH_MOUSE_LL    = 14
+WM_LBUTTONDOWN = 0x0201; WM_LBUTTONUP = 0x0202
+WM_RBUTTONDOWN = 0x0204; WM_RBUTTONUP = 0x0205
+WM_MBUTTONDOWN = 0x0207; WM_MBUTTONUP = 0x0208
+WM_XBUTTONDOWN = 0x020B; WM_XBUTTONUP = 0x020C
+XBUTTON1       = 0x0001; XBUTTON2 = 0x0002
+
+_MOUSE_DOWN = {"x1": WM_XBUTTONDOWN, "x2": WM_XBUTTONDOWN,
+               "left": WM_LBUTTONDOWN, "right": WM_RBUTTONDOWN,
+               "middle": WM_MBUTTONDOWN}
+_MOUSE_UP   = {"x1": WM_XBUTTONUP,   "x2": WM_XBUTTONUP,
+               "left": WM_LBUTTONUP,   "right": WM_RBUTTONUP,
+               "middle": WM_MBUTTONUP}
+_MOUSE_XID  = {"x1": XBUTTON1, "x2": XBUTTON2}
+
+class _Point(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("pt",          _Point),
+        ("mouseData",   ctypes.wintypes.DWORD),
+        ("flags",       ctypes.wintypes.DWORD),
+        ("time",        ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+_HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int,
+                                ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
 _VK = {
     **{c: 0x41 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")},
     **{str(i): 0x30 + i for i in range(10)},
@@ -340,7 +373,10 @@ class HotkeyManager:
         self._on_toggle  = on_toggle
         self._on_ptt_on  = on_ptt_on
         self._on_ptt_off = on_ptt_off
-        self._mouse_timer   = None
+        self._mouse_hook    = None
+        self._mouse_hook_cb = None
+        self._mouse_thread  = None
+        self._mouse_stop    = None
         self._kb_listener   = None
         self._registered: list[int] = []
         self._filter = _HotkeyFilter(self._on_win32_hotkey)
@@ -369,31 +405,57 @@ class HotkeyManager:
         elif hid == HK_PTT:
             self._on_ptt_on()
 
-    # ---- 鼠标 (GetAsyncKeyState 轮询, 比 pynput 钩子更可靠) -----------
+    # ---- 鼠标 (WH_MOUSE_LL 底层钩子, 全球最可靠) -------------------------
     def _start_mouse(self, btn_name: str, is_ptt: bool):
-        vk = _MOUSE_VK.get(btn_name)
-        if vk is None:
+        down_msg = _MOUSE_DOWN.get(btn_name)
+        up_msg   = _MOUSE_UP.get(btn_name)
+        xid      = _MOUSE_XID.get(btn_name)
+        if down_msg is None:
             return
-        self._mouse_vk = vk
+
         self._mouse_is_ptt = is_ptt
-        self._mouse_was_down = False
+        self._mouse_stop   = threading.Event()
 
-        def poll():
-            down = (_GetAsyncKeyState(self._mouse_vk) & 0x8000) != 0
-            if down and not self._mouse_was_down:
-                self._mouse_was_down = True
-                if self._mouse_is_ptt:
-                    self._on_ptt_on()
-                else:
-                    self._on_toggle()
-            elif not down and self._mouse_was_down:
-                self._mouse_was_down = False
-                if self._mouse_is_ptt:
-                    self._on_ptt_off()
+        def hook_proc(nCode, wParam, lParam):
+            if nCode >= 0:
+                if wParam == down_msg:
+                    if xid is not None:
+                        ms = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                        if (ms.mouseData >> 16) != xid:
+                            return _user32.CallNextHookEx(None, nCode, wParam, lParam)
+                    if is_ptt:
+                        QTimer.singleShot(0, self._on_ptt_on)
+                    else:
+                        QTimer.singleShot(0, self._on_toggle)
+                elif wParam == up_msg:
+                    if xid is not None:
+                        ms = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                        if (ms.mouseData >> 16) != xid:
+                            return _user32.CallNextHookEx(None, nCode, wParam, lParam)
+                    if is_ptt:
+                        QTimer.singleShot(0, self._on_ptt_off)
+            return _user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-        self._mouse_timer = QTimer()
-        self._mouse_timer.timeout.connect(poll)
-        self._mouse_timer.start(50)  # 50ms 轮询
+        self._mouse_hook_cb = _HOOKPROC(hook_proc)
+
+        def _hook_thread():
+            hmod = ctypes.windll.kernel32.GetModuleHandleW(None)
+            self._mouse_hook = _user32.SetWindowsHookExW(
+                WH_MOUSE_LL, self._mouse_hook_cb, hmod, 0)
+            tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            msg  = ctypes.wintypes.MSG()
+            while not self._mouse_stop.is_set():
+                while _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
+                    if msg.message == 0x0012:  # WM_QUIT
+                        break
+                    _user32.TranslateMessage(ctypes.byref(msg))
+                    _user32.DispatchMessageW(ctypes.byref(msg))
+                self._mouse_stop.wait(0.05)
+            _user32.UnhookWindowsHookEx(self._mouse_hook)
+            self._mouse_hook = None
+
+        self._mouse_thread = threading.Thread(target=_hook_thread, daemon=True)
+        self._mouse_thread.start()
 
     # ---- pynput 键盘 PTT ---------------------------------------------------
     def _start_kb_ptt(self, spec: str):
@@ -447,10 +509,9 @@ class HotkeyManager:
 
     def stop(self):
         self._unreg_all()
-        if self._mouse_timer is not None:
-            self._mouse_timer.stop()
-            self._mouse_timer.deleteLater()
-            self._mouse_timer = None
+        if self._mouse_stop is not None:
+            self._mouse_stop.set()
+            self._mouse_stop = None
         if self._kb_listener is not None:
             try:
                 self._kb_listener.stop()
@@ -572,6 +633,15 @@ class FloatIndicator(QWidget):
 
     def set_locked(self, locked: bool):
         self._locked = locked
+        try:
+            hwnd = int(self.winId())
+            ex = _user32.GetWindowLongPtrW(hwnd, -20)  # GWL_EXSTYLE
+            if locked:
+                _user32.SetWindowLongPtrW(hwnd, -20, ex | 0x00000020 | 0x00080000)  # WS_EX_TRANSPARENT | WS_EX_LAYERED
+            else:
+                _user32.SetWindowLongPtrW(hwnd, -20, ex & ~(0x00000020 | 0x00080000))
+        except Exception:
+            pass
         self.update()
 
     def mousePressEvent(self, e: QMouseEvent):
@@ -801,6 +871,10 @@ class SettingsWindow(QWidget):
         self._cb_autostart = CheckBox("开机自动启动")
         self._cb_autostart.setChecked(get_auto_start())
         root.addWidget(self._cb_autostart)
+
+        self._cb_admin = CheckBox("下次以管理员身份启动（修复部分系统热键不生效）")
+        self._cb_admin.setChecked(bool(config.get("run_as_admin")))
+        root.addWidget(self._cb_admin)
         root.addStretch(1)
 
         # 按钮
@@ -855,6 +929,7 @@ class SettingsWindow(QWidget):
                 config.set("indicator_size", b.property("v"))
                 break
         set_auto_start(self._cb_autostart.isChecked())
+        config.set("run_as_admin", self._cb_admin.isChecked())
         config.save()
         self.saved.emit()
         self.close()
@@ -1047,6 +1122,10 @@ class App:
 
 # ---------------------------------------------------------------------------
 def main():
+    if config.get("run_as_admin", False) and not is_admin():
+        _kernel32.CloseHandle(_mutex)
+        relaunch_as_admin()
+        sys.exit(0)
     app = App()
     sys.exit(app.run())
 
