@@ -100,7 +100,6 @@ DEFAULTS = {
     "indicator_y":    100,
     "indicator_size": 48,
     "auto_start":     False,
-    "run_as_admin":   False,
     "theme":          "auto",
 }
 
@@ -142,7 +141,7 @@ _com_tls = threading.local()
 def _init_com():
     if not getattr(_com_tls, "ok", False):
         try:
-            ctypes.windll.ole32.CoInitializeEx(0, 2)  # COINIT_APARTMENTTHREADED
+            ctypes.windll.ole32.CoInitializeEx(0, 2)  # APARTMENTTHREADED
         except Exception:
             pass
         _com_tls.ok = True
@@ -276,19 +275,6 @@ def get_auto_start() -> bool:
     except Exception:
         return False
 
-def is_admin():
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-def relaunch_as_admin():
-    try:
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(sys.argv), None, 1)
-    except Exception:
-        pass
-
 # ---------------------------------------------------------------------------
 # Win32 热键解析
 # ---------------------------------------------------------------------------
@@ -296,39 +282,6 @@ _MOUSE_BTNS = {
     "x1": ms.Button.x1, "x2": ms.Button.x2,
     "middle": ms.Button.middle, "left": ms.Button.left, "right": ms.Button.right,
 }
-
-# Raw Input 常量 — 直接读取鼠标硬件信号，无视驱动映射
-WM_INPUT = 0x00FF
-RIM_TYPEMOUSE = 0
-RIDEV_INPUTSINK = 0x00000100
-RID_INPUT = 0x10000003
-
-class _RAWINPUTDEVICE(ctypes.Structure):
-    _fields_ = [("usUsagePage", ctypes.wintypes.USHORT),
-                ("usUsage", ctypes.wintypes.USHORT),
-                ("dwFlags", ctypes.wintypes.DWORD),
-                ("hwndTarget", ctypes.wintypes.HWND)]
-
-class _RAWINPUTHEADER(ctypes.Structure):
-    _fields_ = [("dwType", ctypes.wintypes.DWORD),
-                ("dwSize", ctypes.wintypes.DWORD),
-                ("hDevice", ctypes.wintypes.HANDLE),
-                ("wParam", ctypes.wintypes.WPARAM)]
-
-class _RAWMOUSE(ctypes.Structure):
-    _fields_ = [("usFlags", ctypes.wintypes.USHORT),
-                ("ulButtons", ctypes.wintypes.ULONG),
-                ("usButtonFlags", ctypes.wintypes.USHORT),
-                ("usButtonData", ctypes.wintypes.USHORT),
-                ("ulRawButtons", ctypes.wintypes.ULONG),
-                ("lLastX", ctypes.wintypes.LONG),
-                ("lLastY", ctypes.wintypes.LONG),
-                ("ulExtraInformation", ctypes.wintypes.ULONG)]
-
-_MOUSE_RAW_DOWN = {"x1": 0x0040, "x2": 0x0100, "middle": 0x0010,
-                   "left": 0x0001, "right": 0x0004}
-_MOUSE_RAW_UP =   {"x1": 0x0080, "x2": 0x0200, "middle": 0x0020,
-                   "left": 0x0002, "right": 0x0008}
 _VK = {
     **{c: 0x41 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")},
     **{str(i): 0x30 + i for i in range(10)},
@@ -362,18 +315,16 @@ HK_TOGGLE = 1
 HK_PTT    = 2
 
 class _HotkeyFilter(QAbstractNativeEventFilter):
-    def __init__(self, hotkey_cb, mouse_cb=None):
+    def __init__(self, callback):
         super().__init__()
-        self._hk_cb = hotkey_cb
-        self._mouse_cb = mouse_cb
+        self._cb = callback
 
     def nativeEventFilter(self, event_type, message):
+        # message 是指向 MSG 结构体的指针
         try:
             msg = ctypes.wintypes.MSG.from_address(int(message))
             if msg.message == WM_HOTKEY:
-                self._hk_cb(msg.wParam)
-            elif msg.message == WM_INPUT and self._mouse_cb:
-                self._mouse_cb(msg.lParam)
+                self._cb(msg.wParam)
         except Exception:
             pass
         return False, 0
@@ -386,13 +337,11 @@ class HotkeyManager:
         self._on_toggle  = on_toggle
         self._on_ptt_on  = on_ptt_on
         self._on_ptt_off = on_ptt_off
+        self._mouse_listener = None
         self._kb_listener    = None
         self._registered: list[int] = []
-        self._filter = _HotkeyFilter(self._on_win32_hotkey, self._on_raw_mouse)
+        self._filter = _HotkeyFilter(self._on_win32_hotkey)
         QApplication.instance().installNativeEventFilter(self._filter)
-        self._mouse_raw_down = 0
-        self._mouse_raw_up   = 0
-        self._mouse_is_ptt   = False
 
     # ---- Win32 热键 --------------------------------------------------------
     def _reg(self, hid: int, spec: str) -> bool:
@@ -417,46 +366,22 @@ class HotkeyManager:
         elif hid == HK_PTT:
             self._on_ptt_on()
 
-    # ---- Raw Input 鼠标 (底层硬件信号，无视驱动映射) --------------------------
-    def _on_raw_mouse(self, lParam: int):
-        size = ctypes.c_uint()
-        _user32.GetRawInputData(lParam, RID_INPUT, None, ctypes.byref(size),
-                                ctypes.sizeof(_RAWINPUTHEADER))
-        buf = (ctypes.c_byte * size.value)()
-        if _user32.GetRawInputData(lParam, RID_INPUT, buf, ctypes.byref(size),
-                                   ctypes.sizeof(_RAWINPUTHEADER)) != size.value:
-            return
-        raw = ctypes.cast(buf, ctypes.POINTER(_RAWINPUTHEADER)).contents
-        if raw.dwType != RIM_TYPEMOUSE:
-            return
-        mouse = ctypes.cast(buf, ctypes.POINTER(_RAWMOUSE)).contents
-        flags = mouse.usButtonFlags
-        if flags & self._mouse_raw_down:
-            if self._mouse_is_ptt:
-                self._on_ptt_on()
-            else:
-                self._on_toggle()
-        elif flags & self._mouse_raw_up:
-            if self._mouse_is_ptt:
-                self._on_ptt_off()
-
+    # ---- pynput 鼠标 -------------------------------------------------------
     def _start_mouse(self, btn_name: str, is_ptt: bool):
-        self._mouse_raw_down = _MOUSE_RAW_DOWN.get(btn_name, 0)
-        self._mouse_raw_up   = _MOUSE_RAW_UP.get(btn_name, 0)
-        self._mouse_is_ptt   = is_ptt
-        # 注册 raw input device
-        rid = _RAWINPUTDEVICE()
-        rid.usUsagePage = 0x01
-        rid.usUsage = 0x02
-        rid.dwFlags = RIDEV_INPUTSINK
-        # 使用任意顶层窗口句柄
-        try:
-            hwnd = ctypes.wintypes.HWND(
-                int(QApplication.instance().topLevelWidgets()[0].winId()))
-            rid.hwndTarget = hwnd
-        except Exception:
-            rid.hwndTarget = None
-        _user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid))
+        button = _MOUSE_BTNS.get(btn_name)
+        if button is None:
+            return
+
+        def on_click(x, y, btn, pressed):
+            if btn != button:
+                return
+            if is_ptt:
+                (self._on_ptt_on if pressed else self._on_ptt_off)()
+            elif pressed:
+                self._on_toggle()
+
+        self._mouse_listener = ms.Listener(on_click=on_click)
+        self._mouse_listener.start()
 
     # ---- pynput 键盘 PTT ---------------------------------------------------
     def _start_kb_ptt(self, spec: str):
@@ -510,12 +435,14 @@ class HotkeyManager:
 
     def stop(self):
         self._unreg_all()
-        if self._kb_listener is not None:
-            try:
-                self._kb_listener.stop()
-            except Exception:
-                pass
-        self._kb_listener = None
+        for listener in (self._mouse_listener, self._kb_listener):
+            if listener:
+                try:
+                    listener.stop()
+                except Exception:
+                    pass
+        self._mouse_listener = None
+        self._kb_listener    = None
 
     def restart(self):
         self.stop()
@@ -860,10 +787,6 @@ class SettingsWindow(QWidget):
         self._cb_autostart = CheckBox("开机自动启动")
         self._cb_autostart.setChecked(get_auto_start())
         root.addWidget(self._cb_autostart)
-
-        self._cb_admin = CheckBox("下次以管理员身份启动（修复部分环境热键无法捕获的问题）")
-        self._cb_admin.setChecked(bool(config.get("run_as_admin")))
-        root.addWidget(self._cb_admin)
         root.addStretch(1)
 
         # 按钮
@@ -918,7 +841,6 @@ class SettingsWindow(QWidget):
                 config.set("indicator_size", b.property("v"))
                 break
         set_auto_start(self._cb_autostart.isChecked())
-        config.set("run_as_admin", self._cb_admin.isChecked())
         config.save()
         self.saved.emit()
         self.close()
@@ -1111,10 +1033,6 @@ class App:
 
 # ---------------------------------------------------------------------------
 def main():
-    if config.get("run_as_admin", False) and not is_admin():
-        _kernel32.CloseHandle(_mutex)
-        relaunch_as_admin()
-        sys.exit(0)
     app = App()
     sys.exit(app.run())
 
