@@ -316,7 +316,7 @@ class _MSLLHOOKSTRUCT(ctypes.Structure):
         ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
     ]
 
-_HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int,
+_HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, ctypes.c_int,
                                 ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
 _VK = {
     **{c: 0x41 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")},
@@ -439,9 +439,8 @@ class HotkeyManager:
         self._mouse_hook_cb = _HOOKPROC(hook_proc)
 
         def _hook_thread():
-            hmod = ctypes.windll.kernel32.GetModuleHandleW(None)
             self._mouse_hook = _user32.SetWindowsHookExW(
-                WH_MOUSE_LL, self._mouse_hook_cb, hmod, 0)
+                WH_MOUSE_LL, self._mouse_hook_cb, None, 0)
             tid = ctypes.windll.kernel32.GetCurrentThreadId()
             msg  = ctypes.wintypes.MSG()
             while not self._mouse_stop.is_set():
