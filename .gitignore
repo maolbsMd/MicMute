@@ -1,8 +1,0 @@
-build/
-dist/
-__pycache__/
-*.pyc
-*.pyo
-*.whl
-.env
-opencode.json
