@@ -288,36 +288,15 @@ def relaunch_as_admin():
 # ---------------------------------------------------------------------------
 # Win32 热键解析
 # ---------------------------------------------------------------------------
-# Win32 鼠标底层钩子常量
-WH_MOUSE_LL    = 14
-WM_LBUTTONDOWN = 0x0201; WM_LBUTTONUP = 0x0202
-WM_RBUTTONDOWN = 0x0204; WM_RBUTTONUP = 0x0205
-WM_MBUTTONDOWN = 0x0207; WM_MBUTTONUP = 0x0208
-WM_XBUTTONDOWN = 0x020B; WM_XBUTTONUP = 0x020C
-XBUTTON1       = 0x0001; XBUTTON2 = 0x0002
-
-_MOUSE_DOWN = {"x1": WM_XBUTTONDOWN, "x2": WM_XBUTTONDOWN,
-               "left": WM_LBUTTONDOWN, "right": WM_RBUTTONDOWN,
-               "middle": WM_MBUTTONDOWN}
-_MOUSE_UP   = {"x1": WM_XBUTTONUP,   "x2": WM_XBUTTONUP,
-               "left": WM_LBUTTONUP,   "right": WM_RBUTTONUP,
-               "middle": WM_MBUTTONUP}
-_MOUSE_XID  = {"x1": XBUTTON1, "x2": XBUTTON2}
-
-class _Point(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-class _MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("pt",          _Point),
-        ("mouseData",   ctypes.wintypes.DWORD),
-        ("flags",       ctypes.wintypes.DWORD),
-        ("time",        ctypes.wintypes.DWORD),
-        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
-    ]
-
-_HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, ctypes.c_int,
-                                ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+_MOUSE_VK = {
+    "x1":     0x05,  # VK_XBUTTON1
+    "x2":     0x06,  # VK_XBUTTON2
+    "middle": 0x04,  # VK_MBUTTON
+    "left":   0x01,  # VK_LBUTTON
+    "right":  0x02,  # VK_RBUTTON
+}
+_GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
+_GetAsyncKeyState.restype = ctypes.c_short
 _VK = {
     **{c: 0x41 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")},
     **{str(i): 0x30 + i for i in range(10)},
@@ -373,10 +352,7 @@ class HotkeyManager:
         self._on_toggle  = on_toggle
         self._on_ptt_on  = on_ptt_on
         self._on_ptt_off = on_ptt_off
-        self._mouse_hook    = None
-        self._mouse_hook_cb = None
-        self._mouse_thread  = None
-        self._mouse_stop    = None
+        self._mouse_timer   = None
         self._kb_listener   = None
         self._registered: list[int] = []
         self._filter = _HotkeyFilter(self._on_win32_hotkey)
@@ -405,56 +381,31 @@ class HotkeyManager:
         elif hid == HK_PTT:
             self._on_ptt_on()
 
-    # ---- 鼠标 (WH_MOUSE_LL 底层钩子, 全球最可靠) -------------------------
+    # ---- 鼠标 (GetAsyncKeyState 轮询) --------------------------------
     def _start_mouse(self, btn_name: str, is_ptt: bool):
-        down_msg = _MOUSE_DOWN.get(btn_name)
-        up_msg   = _MOUSE_UP.get(btn_name)
-        xid      = _MOUSE_XID.get(btn_name)
-        if down_msg is None:
+        vk = _MOUSE_VK.get(btn_name)
+        if vk is None:
             return
-
+        self._mouse_vk = vk
         self._mouse_is_ptt = is_ptt
-        self._mouse_stop   = threading.Event()
+        self._mouse_was_down = False
 
-        def hook_proc(nCode, wParam, lParam):
-            if nCode >= 0:
-                if wParam == down_msg:
-                    if xid is not None:
-                        ms = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
-                        if (ms.mouseData >> 16) != xid:
-                            return _user32.CallNextHookEx(None, nCode, wParam, lParam)
-                    if is_ptt:
-                        QTimer.singleShot(0, self._on_ptt_on)
-                    else:
-                        QTimer.singleShot(0, self._on_toggle)
-                elif wParam == up_msg:
-                    if xid is not None:
-                        ms = ctypes.cast(lParam, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
-                        if (ms.mouseData >> 16) != xid:
-                            return _user32.CallNextHookEx(None, nCode, wParam, lParam)
-                    if is_ptt:
-                        QTimer.singleShot(0, self._on_ptt_off)
-            return _user32.CallNextHookEx(None, nCode, wParam, lParam)
+        def poll():
+            down = (_GetAsyncKeyState(self._mouse_vk) & 0x8000) != 0
+            if down and not self._mouse_was_down:
+                self._mouse_was_down = True
+                if self._mouse_is_ptt:
+                    self._on_ptt_on()
+                else:
+                    self._on_toggle()
+            elif not down and self._mouse_was_down:
+                self._mouse_was_down = False
+                if self._mouse_is_ptt:
+                    self._on_ptt_off()
 
-        self._mouse_hook_cb = _HOOKPROC(hook_proc)
-
-        def _hook_thread():
-            self._mouse_hook = _user32.SetWindowsHookExW(
-                WH_MOUSE_LL, self._mouse_hook_cb, None, 0)
-            tid = ctypes.windll.kernel32.GetCurrentThreadId()
-            msg  = ctypes.wintypes.MSG()
-            while not self._mouse_stop.is_set():
-                while _user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):
-                    if msg.message == 0x0012:  # WM_QUIT
-                        break
-                    _user32.TranslateMessage(ctypes.byref(msg))
-                    _user32.DispatchMessageW(ctypes.byref(msg))
-                self._mouse_stop.wait(0.05)
-            _user32.UnhookWindowsHookEx(self._mouse_hook)
-            self._mouse_hook = None
-
-        self._mouse_thread = threading.Thread(target=_hook_thread, daemon=True)
-        self._mouse_thread.start()
+        self._mouse_timer = QTimer()
+        self._mouse_timer.timeout.connect(poll)
+        self._mouse_timer.start(50)  # 50ms 轮询
 
     # ---- pynput 键盘 PTT ---------------------------------------------------
     def _start_kb_ptt(self, spec: str):
@@ -508,9 +459,10 @@ class HotkeyManager:
 
     def stop(self):
         self._unreg_all()
-        if self._mouse_stop is not None:
-            self._mouse_stop.set()
-            self._mouse_stop = None
+        if self._mouse_timer is not None:
+            self._mouse_timer.stop()
+            self._mouse_timer.deleteLater()
+            self._mouse_timer = None
         if self._kb_listener is not None:
             try:
                 self._kb_listener.stop()
