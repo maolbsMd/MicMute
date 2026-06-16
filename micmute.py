@@ -272,35 +272,13 @@ def get_auto_start() -> bool:
     except Exception:
         return False
 
-def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-def relaunch_as_admin():
-    try:
-        ctypes.windll.shell32.ShellExecuteW(
-            None, "runas", sys.executable, " ".join(sys.argv), None, 1)
-    except Exception:
-        pass
-
 # ---------------------------------------------------------------------------
 # Win32 热键解析
 # ---------------------------------------------------------------------------
-_MOUSE_VK = {
-    "x1":     0x05,  # VK_XBUTTON1
-    "x2":     0x06,  # VK_XBUTTON2
-    "middle": 0x04,  # VK_MBUTTON
-    "left":   0x01,  # VK_LBUTTON
-    "right":  0x02,  # VK_RBUTTON
-}
 _MOUSE_BTNS = {
     "x1": ms.Button.x1, "x2": ms.Button.x2,
     "middle": ms.Button.middle, "left": ms.Button.left, "right": ms.Button.right,
 }
-_GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
-_GetAsyncKeyState.restype = ctypes.c_short
 _VK = {
     **{c: 0x41 + i for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")},
     **{str(i): 0x30 + i for i in range(10)},
@@ -356,9 +334,8 @@ class HotkeyManager:
         self._on_toggle  = on_toggle
         self._on_ptt_on  = on_ptt_on
         self._on_ptt_off = on_ptt_off
-        self._mouse_timer   = None
         self._mouse_listener = None
-        self._kb_listener   = None
+        self._kb_listener    = None
         self._registered: list[int] = []
         self._filter = _HotkeyFilter(self._on_win32_hotkey)
         QApplication.instance().installNativeEventFilter(self._filter)
@@ -386,48 +363,22 @@ class HotkeyManager:
         elif hid == HK_PTT:
             self._on_ptt_on()
 
-    # ---- 鼠标 (pynput + GetAsyncKeyState 双保险) ------------------------
+    # ---- pynput 鼠标 -------------------------------------------------------
     def _start_mouse(self, btn_name: str, is_ptt: bool):
         button = _MOUSE_BTNS.get(btn_name)
-        vk = _MOUSE_VK.get(btn_name)
-        if button is None and vk is None:
+        if button is None:
             return
 
-        # --- pynput 鼠标监听 ---
-        if button is not None:
-            def on_click(x, y, btn, pressed):
-                if btn != button:
-                    return
-                if is_ptt:
-                    (self._on_ptt_on if pressed else self._on_ptt_off)()
-                elif pressed:
-                    self._on_toggle()
+        def on_click(x, y, btn, pressed):
+            if btn != button:
+                return
+            if is_ptt:
+                (self._on_ptt_on if pressed else self._on_ptt_off)()
+            elif pressed:
+                self._on_toggle()
 
-            self._mouse_listener = ms.Listener(on_click=on_click)
-            self._mouse_listener.start()
-
-        # --- GetAsyncKeyState 轮询 (兜底) ---
-        if vk is not None:
-            self._mouse_vk = vk
-            self._mouse_is_ptt = is_ptt
-            self._mouse_was_down = False
-
-            def poll():
-                down = (_GetAsyncKeyState(self._mouse_vk) & 0x8000) != 0
-                if down and not self._mouse_was_down:
-                    self._mouse_was_down = True
-                    if self._mouse_is_ptt:
-                        self._on_ptt_on()
-                    else:
-                        self._on_toggle()
-                elif not down and self._mouse_was_down:
-                    self._mouse_was_down = False
-                    if self._mouse_is_ptt:
-                        self._on_ptt_off()
-
-            self._mouse_timer = QTimer()
-            self._mouse_timer.timeout.connect(poll)
-            self._mouse_timer.start(50)
+        self._mouse_listener = ms.Listener(on_click=on_click)
+        self._mouse_listener.start()
 
     # ---- pynput 键盘 PTT ---------------------------------------------------
     def _start_kb_ptt(self, spec: str):
@@ -481,18 +432,14 @@ class HotkeyManager:
 
     def stop(self):
         self._unreg_all()
-        if self._mouse_timer is not None:
-            self._mouse_timer.stop()
-            self._mouse_timer.deleteLater()
-            self._mouse_timer = None
         for listener in (self._mouse_listener, self._kb_listener):
-            if listener is not None:
+            if listener:
                 try:
                     listener.stop()
                 except Exception:
                     pass
         self._mouse_listener = None
-        self._kb_listener = None
+        self._kb_listener    = None
 
     def restart(self):
         self.stop()
@@ -608,15 +555,6 @@ class FloatIndicator(QWidget):
 
     def set_locked(self, locked: bool):
         self._locked = locked
-        try:
-            hwnd = int(self.winId())
-            ex = _user32.GetWindowLongPtrW(hwnd, -20)  # GWL_EXSTYLE
-            if locked:
-                _user32.SetWindowLongPtrW(hwnd, -20, ex | 0x00000020 | 0x00080000)  # WS_EX_TRANSPARENT | WS_EX_LAYERED
-            else:
-                _user32.SetWindowLongPtrW(hwnd, -20, ex & ~(0x00000020 | 0x00080000))
-        except Exception:
-            pass
         self.update()
 
     def mousePressEvent(self, e: QMouseEvent):
@@ -846,10 +784,6 @@ class SettingsWindow(QWidget):
         self._cb_autostart = CheckBox("开机自动启动")
         self._cb_autostart.setChecked(get_auto_start())
         root.addWidget(self._cb_autostart)
-
-        self._cb_admin = CheckBox("下次以管理员身份启动（修复部分系统热键不生效）")
-        self._cb_admin.setChecked(bool(config.get("run_as_admin")))
-        root.addWidget(self._cb_admin)
         root.addStretch(1)
 
         # 按钮
@@ -904,7 +838,6 @@ class SettingsWindow(QWidget):
                 config.set("indicator_size", b.property("v"))
                 break
         set_auto_start(self._cb_autostart.isChecked())
-        config.set("run_as_admin", self._cb_admin.isChecked())
         config.save()
         self.saved.emit()
         self.close()
@@ -1097,10 +1030,6 @@ class App:
 
 # ---------------------------------------------------------------------------
 def main():
-    if config.get("run_as_admin", False) and not is_admin():
-        _kernel32.CloseHandle(_mutex)
-        relaunch_as_admin()
-        sys.exit(0)
     app = App()
     sys.exit(app.run())
 
