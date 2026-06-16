@@ -141,7 +141,10 @@ _com_tls = threading.local()
 
 def _init_com():
     if not getattr(_com_tls, "ok", False):
-        ctypes.windll.ole32.CoInitializeEx(0, 0)
+        try:
+            ctypes.windll.ole32.CoInitializeEx(0, 2)  # COINIT_APARTMENTTHREADED
+        except Exception:
+            pass
         _com_tls.ok = True
 
 class MicController:
