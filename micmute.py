@@ -94,12 +94,13 @@ SETTINGS_FILE = os.path.join(BASE_DIR, "micmute_settings.json")
 DEFAULTS = {
     "mode":           "toggle",
     "toggle_hotkey":  "<ctrl>+<shift>+m",
-    "ptt_hotkey":     "<mouse:x1>",
+    "ptt_hotkey":     "<mouse:x2>",
     "show_indicator": True,
     "indicator_x":    100,
     "indicator_y":    100,
     "indicator_size": 48,
     "auto_start":     False,
+    "run_as_admin":   False,
     "theme":          "auto",
 }
 
@@ -274,6 +275,14 @@ def get_auto_start() -> bool:
             return False
     except Exception:
         return False
+
+def is_admin():
+    try: return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except: return False
+
+def relaunch_as_admin():
+    try: ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+    except: pass
 
 # ---------------------------------------------------------------------------
 # Win32 热键解析
@@ -787,6 +796,10 @@ class SettingsWindow(QWidget):
         self._cb_autostart = CheckBox("开机自动启动")
         self._cb_autostart.setChecked(get_auto_start())
         root.addWidget(self._cb_autostart)
+
+        self._cb_admin = CheckBox("下次以管理员身份启动（修复部分环境热键不生效）")
+        self._cb_admin.setChecked(bool(config.get("run_as_admin")))
+        root.addWidget(self._cb_admin)
         root.addStretch(1)
 
         # 按钮
@@ -841,6 +854,7 @@ class SettingsWindow(QWidget):
                 config.set("indicator_size", b.property("v"))
                 break
         set_auto_start(self._cb_autostart.isChecked())
+        config.set("run_as_admin", self._cb_admin.isChecked())
         config.save()
         self.saved.emit()
         self.close()
@@ -1033,6 +1047,10 @@ class App:
 
 # ---------------------------------------------------------------------------
 def main():
+    if config.get("run_as_admin", False) and not is_admin():
+        _kernel32.CloseHandle(_mutex)
+        relaunch_as_admin()
+        sys.exit(0)
     app = App()
     sys.exit(app.run())
 
