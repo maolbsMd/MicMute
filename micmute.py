@@ -202,7 +202,7 @@ class MicController:
 
     def toggle(self):
         if self._muted:
-            self.unmute()
+            self.unmute(restore=False)
         else:
             self.mute()
         return self._muted
