@@ -950,11 +950,13 @@ class App:
         config.set("show_indicator", False)
         config.save()
         self.ind.hide()
+        self._build_tray()
 
     def _show_ind(self):
         config.set("show_indicator", True)
         config.save()
         self.ind.show()
+        self._build_tray()
 
     # ---- 托盘 --------------------------------------------------------------
     def _build_tray(self):
