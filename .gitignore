@@ -1,0 +1,25 @@
+# ---------- 构建产物 ----------
+build/
+dist/
+*.exe
+
+# PyInstaller 调试残留的 spec（保留规范的 MicMute.spec）
+MicMute_new.spec
+MicMute_v2.spec
+MicMute_v3.spec
+MicMute_v4.spec
+
+# ---------- 本地私密/个人文件，绝不入库 ----------
+# OpenCode 配置，含 API Key
+opencode.json
+# 应用运行时生成的个人配置（热键、指示器位置等）
+micmute_settings.json
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---------- 其他 ----------
+archive/
+test/
