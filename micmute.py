@@ -48,12 +48,11 @@ if _missing:
 # 第三方 import
 # ---------------------------------------------------------------------------
 from PyQt6.QtCore import (
-    Qt, QPoint, QTimer, QRectF, QPointF, pyqtSignal, QAbstractNativeEventFilter,
+    Qt, QTimer, QRectF, QPointF, pyqtSignal, QObject, QAbstractNativeEventFilter,
 )
 from PyQt6.QtGui import (
     QIcon, QFont, QColor, QPainter, QPen, QBrush, QPainterPath,
-    QLinearGradient, QRadialGradient, QConicalGradient,
-    QAction, QPixmap, QMouseEvent, QPaintEvent, QGuiApplication,
+    QLinearGradient, QAction, QPixmap, QMouseEvent, QPaintEvent, QGuiApplication,
 )
 from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QWidget,
@@ -77,10 +76,49 @@ IID_IAudioMeterInformation  = GUID("{C02216F6-8C67-4B5B-9D00-D008E73E0064}")
 # ---------------------------------------------------------------------------
 # 单实例
 # ---------------------------------------------------------------------------
-_kernel32 = ctypes.windll.kernel32
-_user32   = ctypes.windll.user32
-_mutex = _kernel32.CreateMutexW(None, False, f"Global\\{APP_NAME}Tool")
-if _kernel32.GetLastError() == 183:
+# 旧写法 `GetLastError() == 183` 是失效的, 原因有两点:
+#   1. 已有实例存在但当前进程拿不到完整权限时, CreateMutexW 返回的是
+#      ERROR_ACCESS_DENIED (5) 而不是 ERROR_ALREADY_EXISTS (183)。实测提权实例
+#      持有 Global\MicMuteTool 时, 非提权进程拿到的正是 5;
+#   2. ctypes.windll 默认不保存 last error, 再单独调 GetLastError() 也读不准。
+# 所以改为先用 OpenMutex 探测 (只需 SYNCHRONIZE 权限, 可跨权限打开已存在对象),
+# 再创建, 并在 Global 不可用时回退到会话级的 Local 命名空间。
+_ERROR_ALREADY_EXISTS = 183
+_SYNCHRONIZE          = 0x00100000
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_user32   = ctypes.WinDLL("user32", use_last_error=True)
+
+_kernel32.CreateMutexW.restype  = ctypes.wintypes.HANDLE
+_kernel32.CreateMutexW.argtypes = [ctypes.wintypes.LPVOID, ctypes.wintypes.BOOL,
+                                   ctypes.wintypes.LPCWSTR]
+_kernel32.OpenMutexW.restype    = ctypes.wintypes.HANDLE
+_kernel32.OpenMutexW.argtypes   = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL,
+                                   ctypes.wintypes.LPCWSTR]
+_kernel32.CloseHandle.restype   = ctypes.wintypes.BOOL
+_kernel32.CloseHandle.argtypes  = [ctypes.wintypes.HANDLE]
+
+_MUTEX_NAMES = (f"Global\\{APP_NAME}Tool", f"Local\\{APP_NAME}Tool")
+
+def _acquire_single_instance():
+    """成功则返回持有的互斥体句柄; 已有实例在运行则返回 None"""
+    for name in _MUTEX_NAMES:                       # 先探测是否已有实例
+        h = _kernel32.OpenMutexW(_SYNCHRONIZE, False, name)
+        if h:
+            _kernel32.CloseHandle(h)
+            return None
+    for name in _MUTEX_NAMES:                       # 再尝试创建并持有
+        h = _kernel32.CreateMutexW(None, False, name)
+        if not h:
+            continue
+        if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+            _kernel32.CloseHandle(h)
+            return None
+        return h
+    return None
+
+_mutex = _acquire_single_instance()
+if _mutex is None:
     _user32.MessageBoxW(0, f"{APP_NAME} 已在运行。\n请检查系统托盘。", APP_NAME, 0x40)
     sys.exit(0)
 
@@ -148,10 +186,17 @@ def _init_com():
         _com_tls.ok = True
 
 class MicController:
+    """麦克风静音控制。
+
+    只切换 IAudioEndpointVolume.SetMute，不修改音量大小。
+    这样可以避免破坏用户原有的音量设置，也不会出现"取消静音后没有声音"
+    的问题（旧实现会在取消静音时把音量强制拉到 100%）。
+    """
+
     def __init__(self):
-        self._muted    = False
-        self._saved:   dict = {}
-        self._ptt_held = None
+        self._muted      = False
+        self._ptt_held   = False
+        self._ptt_active = False
 
     def _devices(self):
         _init_com()
@@ -171,38 +216,26 @@ class MicController:
             pass
         return result
 
-    def mute(self, save=True):
-        if save:
-            self._saved.clear()
-        for did, vol in self._devices():
+    def _apply(self, mute: bool):
+        for _, vol in self._devices():
             try:
-                if save:
-                    self._saved[did] = (vol.GetMute(), vol.GetMasterVolumeLevelScalar())
-                vol.SetMute(True, None)
-                vol.SetMasterVolumeLevelScalar(0.0, None)
+                vol.SetMute(bool(mute), None)
             except Exception:
                 pass
+
+    def mute(self):
+        self._apply(True)
         self._muted = True
 
-    def unmute(self, restore=True):
-        for did, vol in self._devices():
-            try:
-                if restore and did in self._saved:
-                    old_m, old_v = self._saved[did]
-                    vol.SetMute(old_m, None)
-                    vol.SetMasterVolumeLevelScalar(old_v, None)
-                else:
-                    vol.SetMute(False, None)
-                    vol.SetMasterVolumeLevelScalar(1.0, None)
-            except Exception:
-                pass
-        if restore:
-            self._saved.clear()
+    def unmute(self):
+        self._apply(False)
         self._muted = False
 
     def toggle(self):
+        # 手动切换时放弃 PTT 的中间状态，避免状态错乱
+        self._ptt_held = self._ptt_active = False
         if self._muted:
-            self.unmute(restore=False)
+            self.unmute()
         else:
             self.mute()
         return self._muted
@@ -211,19 +244,20 @@ class MicController:
         return self._muted
 
     def ptt_press(self):
-        if self._ptt_held is not None:
+        if self._ptt_held:
             return
-        self._ptt_held = self._muted
+        self._ptt_held   = True
+        self._ptt_active = self._muted
         if self._muted:
-            self.unmute(restore=False)
+            self.unmute()
 
     def ptt_release(self):
-        if self._ptt_held is None:
+        if not self._ptt_held:
             return
-        was = self._ptt_held
-        self._ptt_held = None
-        if was:
-            self.mute(save=False)
+        self._ptt_held = False
+        if self._ptt_active:
+            self._ptt_active = False
+            self.mute()
 
     def peak(self) -> float:
         _init_com()
@@ -247,41 +281,55 @@ def _beep(muted: bool):
     threading.Thread(target=winsound.Beep, args=(freq, 120), daemon=True).start()
 
 # 开机启动
-def _get_startup_key():
+def _autostart_command() -> str:
+    """返回写入 Run 键的完整命令行（带引号，兼容含空格的路径）"""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+def _get_startup_key(access: int):
     return winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-        r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_ALL_ACCESS)
+        r"Software\Microsoft\Windows\CurrentVersion\Run", 0, access)
 
 def set_auto_start(enable: bool):
     try:
-        key = _get_startup_key()
+        key = _get_startup_key(winreg.KEY_SET_VALUE)
+    except Exception:
+        return
+    try:
         if enable:
-            exe = sys.executable if not getattr(sys, "frozen", False) else sys.executable
-            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe)
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, _autostart_command())
         else:
-            winreg.DeleteValue(key, APP_NAME)
-        winreg.CloseKey(key)
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
     except Exception:
         pass
+    finally:
+        winreg.CloseKey(key)
 
 def get_auto_start() -> bool:
     try:
-        key = _get_startup_key()
-        try:
-            winreg.QueryValueEx(key, APP_NAME)
-            winreg.CloseKey(key)
-            return True
-        except Exception:
-            winreg.CloseKey(key)
-            return False
+        key = _get_startup_key(winreg.KEY_QUERY_VALUE)
     except Exception:
         return False
+    try:
+        winreg.QueryValueEx(key, APP_NAME)
+        return True
+    except Exception:
+        return False
+    finally:
+        winreg.CloseKey(key)
 
 def is_admin():
     try: return bool(ctypes.windll.shell32.IsUserAnAdmin())
     except: return False
 
 def relaunch_as_admin():
-    try: ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+    try:
+        params = " ".join(f'"{a}"' for a in sys.argv)
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
     except: pass
 
 # ---------------------------------------------------------------------------
@@ -301,13 +349,25 @@ _VK = {
     "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
 }
 _MOD = {"<ctrl>": 0x0002, "<shift>": 0x0004, "<alt>": 0x0001, "<cmd>": 0x0008}
+_MOD_ALIAS = {
+    "ctrl": "<ctrl>", "control": "<ctrl>",
+    "shift": "<shift>",
+    "alt": "<alt>",
+    "cmd": "<cmd>", "win": "<cmd>", "super": "<cmd>",
+}
 _NOREPEAT = 0x4000
 
 def _parse_hk(spec: str):
-    """'<ctrl>+<shift>+m' -> (mod, vk) 或 None"""
+    """'<ctrl>+<shift>+m' 或 'ctrl+shift+m' -> (mod, vk) 或 None
+
+    注意: 不带尖括号的修饰键也必须识别, 否则 'ctrl+alt+space' 会被当成
+    单独的 Space 注册成全局热键。
+    """
     mod, vk = _NOREPEAT, None
     for p in spec.lower().split("+"):
-        p = p.strip()
+        p = _MOD_ALIAS.get(p.strip(), p.strip())
+        if not p:
+            continue
         if p in _MOD:
             mod |= _MOD[p]
         elif p.startswith("<") and p.endswith(">"):
@@ -339,18 +399,41 @@ class _HotkeyFilter(QAbstractNativeEventFilter):
         return False, 0
 
 # ---------------------------------------------------------------------------
+# 线程桥: pynput 监听线程 -> Qt 主线程
+# ---------------------------------------------------------------------------
+class HotkeyBridge(QObject):
+    """pynput 的回调运行在后台线程, 必须通过信号把动作投递回 Qt 主线程。
+
+    直接在后台线程里操作托盘图标/窗口属于未定义行为, 会导致偶发崩溃或界面错乱;
+    在后台线程调用 QTimer.singleShot 则因为该线程没有 Qt 事件循环而永远不会触发。
+    """
+    toggle  = pyqtSignal()
+    ptt_on  = pyqtSignal()
+    ptt_off = pyqtSignal()
+
+
+# ---------------------------------------------------------------------------
 # 快捷键管理
 # ---------------------------------------------------------------------------
 class HotkeyManager:
-    def __init__(self, on_toggle, on_ptt_on, on_ptt_off):
-        self._on_toggle  = on_toggle
-        self._on_ptt_on  = on_ptt_on
-        self._on_ptt_off = on_ptt_off
+    def __init__(self, on_toggle, on_ptt_on, on_ptt_off, on_error=None):
+        self._on_error = on_error
+        self._bridge = HotkeyBridge()
+        self._bridge.toggle.connect(on_toggle)
+        self._bridge.ptt_on.connect(on_ptt_on)
+        self._bridge.ptt_off.connect(on_ptt_off)
         self._mouse_listener = None
         self._kb_listener    = None
         self._registered: list[int] = []
         self._filter = _HotkeyFilter(self._on_win32_hotkey)
         QApplication.instance().installNativeEventFilter(self._filter)
+
+    def _fail(self, spec: str):
+        if self._on_error:
+            try:
+                self._on_error(spec)
+            except Exception:
+                pass
 
     # ---- Win32 热键 --------------------------------------------------------
     def _reg(self, hid: int, spec: str) -> bool:
@@ -370,34 +453,39 @@ class HotkeyManager:
         self._registered.clear()
 
     def _on_win32_hotkey(self, hid: int):
+        # nativeEventFilter 本身就在 Qt 主线程执行
         if hid == HK_TOGGLE:
-            self._on_toggle()
+            self._bridge.toggle.emit()
         elif hid == HK_PTT:
-            self._on_ptt_on()
+            self._bridge.ptt_on.emit()
 
     # ---- pynput 鼠标 -------------------------------------------------------
-    def _start_mouse(self, btn_name: str, is_ptt: bool):
+    def _start_mouse(self, btn_name: str, is_ptt: bool) -> bool:
         button = _MOUSE_BTNS.get(btn_name)
         if button is None:
-            return
+            return False
 
         def on_click(x, y, btn, pressed):
             if btn != button:
                 return
             if is_ptt:
-                (self._on_ptt_on if pressed else self._on_ptt_off)()
+                (self._bridge.ptt_on if pressed else self._bridge.ptt_off).emit()
             elif pressed:
-                self._on_toggle()
+                self._bridge.toggle.emit()
 
         self._mouse_listener = ms.Listener(on_click=on_click)
         self._mouse_listener.start()
+        return True
 
     # ---- pynput 键盘 PTT ---------------------------------------------------
-    def _start_kb_ptt(self, spec: str):
+    def _start_kb_ptt(self, spec: str) -> bool:
         try:
             combo = set(kb.HotKey.parse(spec))
         except Exception:
-            return
+            return False
+        if not combo:
+            return False
+
         pressed: set = set()
         active  = [False]
 
@@ -411,36 +499,39 @@ class HotkeyManager:
             pressed.add(norm(key))
             if not active[0] and combo.issubset(pressed):
                 active[0] = True
-                QTimer.singleShot(0, self._on_ptt_on)
+                self._bridge.ptt_on.emit()
 
         def on_release(key):
             k = norm(key)
             if active[0] and k in combo:
                 active[0] = False
-                QTimer.singleShot(0, self._on_ptt_off)
+                self._bridge.ptt_off.emit()
             pressed.discard(k)
 
         self._kb_listener = kb.Listener(on_press=on_press, on_release=on_release)
         self._kb_listener.start()
+        return True
 
     # ---- 生命周期 ----------------------------------------------------------
     def start(self):
         mode      = config.get("mode")
-        toggle_hk = config.get("toggle_hotkey") or ""
-        ptt_hk    = config.get("ptt_hotkey")    or ""
+        toggle_hk = (config.get("toggle_hotkey") or "").strip()
+        ptt_hk    = (config.get("ptt_hotkey")    or "").strip()
 
         if mode == "toggle":
             if toggle_hk.startswith("<mouse:"):
-                btn = toggle_hk.replace("<mouse:", "").rstrip(">")
-                self._start_mouse(btn, is_ptt=False)
+                if not self._start_mouse(toggle_hk[len("<mouse:"):].rstrip(">"), is_ptt=False):
+                    self._fail(toggle_hk)
             elif toggle_hk:
-                self._reg(HK_TOGGLE, toggle_hk)
+                if not self._reg(HK_TOGGLE, toggle_hk):
+                    self._fail(toggle_hk)
         else:  # ptt
             if ptt_hk.startswith("<mouse:"):
-                btn = ptt_hk.replace("<mouse:", "").rstrip(">")
-                self._start_mouse(btn, is_ptt=True)
+                if not self._start_mouse(ptt_hk[len("<mouse:"):].rstrip(">"), is_ptt=True):
+                    self._fail(ptt_hk)
             elif ptt_hk:
-                self._start_kb_ptt(ptt_hk)
+                if not self._start_kb_ptt(ptt_hk):
+                    self._fail(ptt_hk)
 
     def stop(self):
         self._unreg_all()
@@ -544,7 +635,16 @@ class FloatIndicator(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
-        self._timer.start(80)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._poll()
+        if not self._timer.isActive():
+            self._timer.start(80)
+
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self._timer.stop()   # 隐藏时停止轮询, 省掉每 80ms 一次的 COM 调用
 
     def _apply_size(self):
         self.setFixedSize(self.SIZE, self.SIZE)
@@ -811,25 +911,6 @@ class SettingsWindow(QWidget):
         br.addStretch(1); br.addWidget(btn_cancel); br.addWidget(btn_save)
         root.addLayout(br)
 
-    def _record(self, which: str):
-        if self._recording[which]:
-            return
-        self._recording[which] = True
-        btn = self._btn_tog if which == "toggle" else self._btn_ptt
-        btn.setText("⏺ 等待按键…"); btn.setEnabled(False)
-
-        def on_done(spec):
-            def apply():
-                if spec:
-                    config.set("toggle_hotkey" if which == "toggle" else "ptt_hotkey", spec)
-                self._btn_tog.setText(config.get("toggle_hotkey") or "未设置")
-                self._btn_ptt.setText(config.get("ptt_hotkey") or "未设置")
-                btn.setEnabled(True)
-                self._recording[which] = False
-            QTimer.singleShot(0, apply)
-
-        record_hotkey(on_done)
-
     def _save(self):
         config.set("mode", "ptt" if self._rb_ptt.isChecked() else "toggle")
         config.set("show_indicator", self._cb_show.isChecked())
@@ -892,6 +973,7 @@ class App:
             on_toggle  = self._do_toggle,
             on_ptt_on  = self._ptt_on,
             on_ptt_off = self._ptt_off,
+            on_error   = self._hotkey_error,
         )
 
         # PTT 模式启动时默认静音
@@ -934,6 +1016,15 @@ class App:
         self.ind.set_state(muted, self._ptt)
         if sound:
             _beep(muted)
+
+    def _hotkey_error(self, spec: str):
+        try:
+            self.tray.showMessage(
+                APP_NAME,
+                f"快捷键 “{spec}” 注册失败。\n可能已被其它程序占用，或需要以管理员身份运行。",
+                QSystemTrayIcon.MessageIcon.Warning, 4000)
+        except Exception:
+            pass
 
     # ---- 指示器 ------------------------------------------------------------
     def _apply_vis(self):
@@ -1026,14 +1117,9 @@ class App:
     # ---- 生命周期 ----------------------------------------------------------
     def shutdown(self):
         self.hk.stop()
-        # 退出时无条件强制恢复所有麦克风，不依赖内部状态
+        # 退出时无条件解除静音，不依赖内部状态
         try:
-            for _, vol in mic._devices():
-                try:
-                    vol.SetMute(False, None)
-                    vol.SetMasterVolumeLevelScalar(1.0, None)
-                except Exception:
-                    pass
+            mic.unmute()
         except Exception:
             pass
         config.save()
